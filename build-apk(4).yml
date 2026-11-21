@@ -1,0 +1,193 @@
+name: Build NEXUS ROOT APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'NEXUS_ROOT_SOURCE.zip'
+      - 'NEXUS_ROOT_SOURCE(1).zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-root-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_COMPILE_SDK: '35'
+  ANDROID_BUILD_TOOLS: '35.0.0'
+  ANDROID_NDK_VERSION: 'r26b'
+  KERNELPATCH_REF: 'main'
+
+jobs:
+  build:
+    name: Build NEXUS ROOT with root-engine adapters + APatch ARM64 boot-image patcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate and extract source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f 'NEXUS_ROOT_SOURCE(1).zip' ]]; then
+            ARCHIVE='NEXUS_ROOT_SOURCE(1).zip'
+          elif [[ -f 'NEXUS_ROOT_SOURCE.zip' ]]; then
+            ARCHIVE='NEXUS_ROOT_SOURCE.zip'
+          else
+            echo 'ERROR: Put NEXUS_ROOT_SOURCE.zip or NEXUS_ROOT_SOURCE(1).zip in the repository root.'
+            echo 'Files in repository root:'
+            ls -la
+            exit 1
+          fi
+
+          SRC="$RUNNER_TEMP/nexus-source"
+          mkdir -p "$SRC"
+          unzip -t "$ARCHIVE"
+          unzip -q "$ARCHIVE" -d "$SRC"
+
+          test -f "$SRC/settings.gradle.kts" || { echo 'settings.gradle.kts missing in source archive'; exit 1; }
+          test -f "$SRC/build.gradle.kts" || { echo 'root build.gradle.kts missing in source archive'; exit 1; }
+          test -f "$SRC/app/build.gradle.kts" || { echo 'app/build.gradle.kts missing in source archive'; exit 1; }
+          test -f "$SRC/app/src/main/AndroidManifest.xml" || { echo 'AndroidManifest.xml missing in source archive'; exit 1; }
+
+          # Copy only project files. Never overwrite the workflow currently running from the repository.
+          cp -f "$SRC/settings.gradle.kts" "$GITHUB_WORKSPACE/"
+          cp -f "$SRC/build.gradle.kts" "$GITHUB_WORKSPACE/"
+          [[ ! -f "$SRC/gradle.properties" ]] || cp -f "$SRC/gradle.properties" "$GITHUB_WORKSPACE/"
+          rm -rf "$GITHUB_WORKSPACE/app"
+          cp -a "$SRC/app" "$GITHUB_WORKSPACE/app"
+          echo "Using source archive: $ARCHIVE"
+          find app/src/main -maxdepth 4 -type f -print
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git curl xz-utils unzip file binutils
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK and accept licenses
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Install AArch64 bare-metal compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='12.2.rel1'
+          ARCHIVE="arm-gnu-toolchain-${VERSION}-x86_64-aarch64-none-elf.tar.xz"
+          URL="https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
+          curl --fail --location --retry 4 --retry-delay 2 "$URL" -o "$RUNNER_TEMP/$ARCHIVE"
+          mkdir -p "$RUNNER_TEMP/arm-gnu-toolchain"
+          tar -xJf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP/arm-gnu-toolchain" --strip-components=1
+          test -x "$RUNNER_TEMP/arm-gnu-toolchain/bin/aarch64-none-elf-gcc"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain/bin" >> "$GITHUB_PATH"
+          echo "TARGET_COMPILE=$RUNNER_TEMP/arm-gnu-toolchain/bin/aarch64-none-elf-" >> "$GITHUB_ENV"
+
+      - name: Build official KernelPatch kpimg-android and kptools
+        shell: bash
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          test -n "$NDK_PATH" && test -d "$NDK_PATH" || { echo 'Android NDK path was not provided by setup-ndk'; exit 1; }
+          git clone --depth 1 --branch "$KERNELPATCH_REF" --recurse-submodules \
+            https://github.com/bmax121/KernelPatch.git "$RUNNER_TEMP/KernelPatch"
+          echo "KernelPatch revision: $(git -C "$RUNNER_TEMP/KernelPatch" rev-parse HEAD)"
+
+          # Follow the upstream KernelPatch CI build sequence for Android kpimg.
+          export TARGET_COMPILE="$RUNNER_TEMP/arm-gnu-toolchain/bin/aarch64-none-elf-"
+          export ANDROID=1
+          make -C "$RUNNER_TEMP/KernelPatch/kernel" hdr kpimg
+
+          KPIMG="$RUNNER_TEMP/KernelPatch/kernel/kpimg"
+          test -s "$KPIMG" || { echo 'KernelPatch did not produce kernel/kpimg'; exit 1; }
+
+          # Build kptools as an Android ARM64 executable, not as a host binary.
+          BUILD_DIR="$RUNNER_TEMP/KernelPatch/tools/build/android"
+          mkdir -p "$BUILD_DIR"
+          cmake -S "$RUNNER_TEMP/KernelPatch/tools" -B "$BUILD_DIR" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_ABI=arm64-v8a
+          cmake --build "$BUILD_DIR" --parallel 2
+
+          KPTOOLS="$BUILD_DIR/kptools"
+          test -s "$KPTOOLS" || { echo 'Android kptools executable was not produced'; find "$BUILD_DIR" -maxdepth 3 -type f -print; exit 1; }
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" "$KPTOOLS"
+
+          # The app currently launches this executable from ApplicationInfo.nativeLibraryDir.
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets
+          install -m 0755 "$KPTOOLS" app/src/main/jniLibs/arm64-v8a/libkptools.so
+          install -m 0644 "$KPIMG" app/src/main/assets/kpimg-android
+
+          file app/src/main/jniLibs/arm64-v8a/libkptools.so app/src/main/assets/kpimg-android
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h app/src/main/jniLibs/arm64-v8a/libkptools.so | grep -E 'Class:|Machine:'
+          test "$(stat -c %s app/src/main/assets/kpimg-android)" -gt 4096
+
+      - name: Ensure native executable is extracted on Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          old = 'jniLibs { keepDebugSymbols += "**/libkptools.so" }'
+          new = 'jniLibs { useLegacyPackaging = true; keepDebugSymbols += "**/libkptools.so" }'
+          if new in s:
+              print('Legacy native-library extraction already enabled')
+          elif old in s:
+              p.write_text(s.replace(old, new, 1))
+              print('Enabled extraction of bundled kptools executable')
+          else:
+              raise SystemExit('Could not safely update jniLibs packaging block in app/build.gradle.kts')
+          PY
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace :app:assembleDebug
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK" || { echo 'APK output is missing'; exit 1; }
+          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libkptools.so'
+          unzip -l "$APK" | grep -F 'assets/kpimg-android'
+          "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner" verify --verbose "$APK"
+          sha256sum "$APK"
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-ROOT-v0.9-APatch-ARM64-Boot-Patcher
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
