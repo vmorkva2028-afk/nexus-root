@@ -1,4 +1,5 @@
-name: Build NEXUS ROOT APK
+
+name: Build NEXUS ROOT and KernelPatch
 
 on:
   workflow_dispatch:
@@ -12,36 +13,143 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f NEXUS_ROOT_SOURCE.zip
+          mkdir -p "$RUNNER_TEMP/nexus"
+          unzip -q NEXUS_ROOT_SOURCE.zip -d "$RUNNER_TEMP/nexus"
+          cp -a "$RUNNER_TEMP/nexus/." "$GITHUB_WORKSPACE/"
 
-      - name: Set up Gradle
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            unzip \
+            xz-utils \
+            file
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+
+      - name: Install ARM bare-metal compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=14.2.rel1
+          ARCHIVE="arm-gnu-toolchain-${VERSION}-x86_64-aarch64-none-elf.tar.xz"
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
+
+          curl -fL --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/$ARCHIVE"
+
+          mkdir -p "$RUNNER_TEMP/arm-toolchain"
+
+          tar -xJf "$RUNNER_TEMP/$ARCHIVE" \
+            -C "$RUNNER_TEMP/arm-toolchain" \
+            --strip-components=1
+
+          echo "$RUNNER_TEMP/arm-toolchain/bin" >> "$GITHUB_PATH"
+          echo "TARGET_COMPILE=aarch64-none-elf-" >> "$GITHUB_ENV"
+
+      - name: Download KernelPatch source
+        run: |
+          git clone --depth 1 \
+            https://github.com/bmax121/KernelPatch.git \
+            "$RUNNER_TEMP/KernelPatch"
+
+      - name: Build kpimg Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$RUNNER_TEMP/KernelPatch/kernel"
+
+          export TARGET_COMPILE=aarch64-none-elf-
+          export ANDROID=1
+
+          make -j2
+
+          test -s kpimg
+
+          mkdir -p "$GITHUB_WORKSPACE/kernelpatch-tools"
+
+          cp kpimg \
+            "$GITHUB_WORKSPACE/kernelpatch-tools/kpimg-android"
+
+      - name: Build kptools for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KP="$RUNNER_TEMP/KernelPatch"
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+
+          make -C "$KP/kernel" hdr
+
+          mkdir -p "$KP/tools/build-android"
+
+          cd "$KP/tools/build-android"
+
+          export ANDROID=1
+
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26
+
+          cmake --build . --parallel 2
+
+          KPTOOLS="$(find . -type f -name kptools -size +4k | head -n 1)"
+
+          if [ -z "$KPTOOLS" ]; then
+            echo "Android kptools executable not found"
+            exit 1
+          fi
+
+          install -m 0755 "$KPTOOLS" \
+            "$GITHUB_WORKSPACE/kernelpatch-tools/kptools-android"
+
+          file "$GITHUB_WORKSPACE/kernelpatch-tools/kptools-android"
+          file "$GITHUB_WORKSPACE/kernelpatch-tools/kpimg-android"
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Extract Android project
+      - name: Build APK
         run: |
-          unzip -q NEXUS_ROOT_SOURCE.zip -d source
-          test -f source/settings.gradle.kts
-          test -f source/app/build.gradle.kts
+          gradle --no-daemon :app:assembleDebug
 
-      - name: Build debug APK (without tests)
-        working-directory: source
-        run: gradle --no-daemon :app:assembleDebug
-
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NEXUS-ROOT-debug-apk
-          path: source/app/build/outputs/apk/debug/app-debug.apk
+          name: NEXUS-ROOT-APK
+          path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
+
+      - name: Upload KernelPatch tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-ROOT-KERNELPATCH-ARM64
+          path: kernelpatch-tools/*
+          if-no-files-found: error
