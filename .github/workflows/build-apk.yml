@@ -1,11 +1,11 @@
 
-name: Build NEXUS ROOT and KernelPatch
+name: Build NEXUS ROOT with real APatch tools
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'NEXUS_ROOT_SOURCE.zip'
+      - 'NEXUS_ROOT_SOURCE(1).zip'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -19,43 +19,69 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract source
+      - name: Extract NEXUS ROOT source
         shell: bash
         run: |
           set -euo pipefail
-          test -f NEXUS_ROOT_SOURCE.zip
-          mkdir -p "$RUNNER_TEMP/nexus"
-          unzip -q NEXUS_ROOT_SOURCE.zip -d "$RUNNER_TEMP/nexus"
-          cp -a "$RUNNER_TEMP/nexus/." "$GITHUB_WORKSPACE/"
+
+          SOURCE='NEXUS_ROOT_SOURCE(1).zip'
+
+          test -f "$SOURCE" || {
+            echo "ERROR: $SOURCE not found"
+            ls -la
+            exit 1
+          }
+
+          unzip -tq "$SOURCE"
+
+          mkdir -p "$RUNNER_TEMP/nexus-source"
+          unzip -oq "$SOURCE" -d "$RUNNER_TEMP/nexus-source"
+
+          SRC="$RUNNER_TEMP/nexus-source"
+
+          test -d "$SRC/app"
+          test -f "$SRC/settings.gradle.kts"
+          test -f "$SRC/build.gradle.kts"
+
+          cp -a "$SRC/app" "$GITHUB_WORKSPACE/"
+          cp "$SRC/settings.gradle.kts" "$GITHUB_WORKSPACE/"
+          cp "$SRC/build.gradle.kts" "$GITHUB_WORKSPACE/"
+          cp "$SRC/gradle.properties" "$GITHUB_WORKSPACE/"
+
+          echo "NEXUS ROOT source extracted."
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            cmake \
-            ninja-build \
             git \
             curl \
             unzip \
             xz-utils \
+            cmake \
+            ninja-build \
             file
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK
-        run: |
-          sdkmanager "ndk;27.2.12479018"
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+          add-to-path: true
 
-      - name: Install ARM bare-metal compiler
+      - name: Install ARM64 bare-metal compiler
         shell: bash
         run: |
           set -euo pipefail
 
-          VERSION=14.2.rel1
+          VERSION=12.2.rel1
           ARCHIVE="arm-gnu-toolchain-${VERSION}-x86_64-aarch64-none-elf.tar.xz"
-          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
+
+          URL="https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
 
           curl -fL --retry 3 "$URL" \
             -o "$RUNNER_TEMP/$ARCHIVE"
@@ -66,90 +92,100 @@ jobs:
             -C "$RUNNER_TEMP/arm-toolchain" \
             --strip-components=1
 
-          echo "$RUNNER_TEMP/arm-toolchain/bin" >> "$GITHUB_PATH"
-          echo "TARGET_COMPILE=aarch64-none-elf-" >> "$GITHUB_ENV"
-
-      - name: Download KernelPatch source
-        run: |
-          git clone --depth 1 \
-            https://github.com/bmax121/KernelPatch.git \
-            "$RUNNER_TEMP/KernelPatch"
-
-      - name: Build kpimg Android
+      - name: Download KernelPatch
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$RUNNER_TEMP/KernelPatch/kernel"
+          git clone --depth 1 \
+            https://github.com/bmax121/KernelPatch.git \
+            "$RUNNER_TEMP/KernelPatch"
 
-          export TARGET_COMPILE=aarch64-none-elf-
-          export ANDROID=1
-
-          make -j2
-
-          test -s kpimg
-
-          mkdir -p "$GITHUB_WORKSPACE/kernelpatch-tools"
-
-          cp kpimg \
-            "$GITHUB_WORKSPACE/kernelpatch-tools/kpimg-android"
-
-      - name: Build kptools for Android ARM64
+      - name: Build kpimg-android
         shell: bash
         run: |
           set -euo pipefail
 
           KP="$RUNNER_TEMP/KernelPatch"
-          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
 
-          make -C "$KP/kernel" hdr
-
-          mkdir -p "$KP/tools/build-android"
-
-          cd "$KP/tools/build-android"
-
+          export TARGET_COMPILE="$RUNNER_TEMP/arm-toolchain/bin/aarch64-none-elf-"
           export ANDROID=1
 
-          cmake .. \
+          cd "$KP/kernel"
+
+          make -j2 hdr kpimg
+
+          test -s kpimg
+
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
+
+          cp kpimg \
+            "$GITHUB_WORKSPACE/app/src/main/assets/kpimg-android"
+
+          echo "kpimg-android built successfully."
+
+      - name: Build Android ARM64 kptools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KP="$RUNNER_TEMP/KernelPatch"
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+
+          cd "$KP/tools"
+
+          mkdir -p build/android
+          cd build/android
+
+          cmake \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_PLATFORM=android-33 \
             -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-26
+            ../..
 
           cmake --build . --parallel 2
 
-          KPTOOLS="$(find . -type f -name kptools -size +4k | head -n 1)"
+          test -s kptools
 
-          if [ -z "$KPTOOLS" ]; then
-            echo "Android kptools executable not found"
-            exit 1
-          fi
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" kptools
 
-          install -m 0755 "$KPTOOLS" \
-            "$GITHUB_WORKSPACE/kernelpatch-tools/kptools-android"
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
 
-          file "$GITHUB_WORKSPACE/kernelpatch-tools/kptools-android"
-          file "$GITHUB_WORKSPACE/kernelpatch-tools/kpimg-android"
+          install -m 0755 kptools \
+            "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so"
+
+          file "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so"
+
+          echo "Android ARM64 kptools built successfully."
+
+      - name: Verify APatch tools in application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s app/src/main/assets/kpimg-android
+          test -s app/src/main/jniLibs/arm64-v8a/libkptools.so
+
+          echo "Both APatch tools are present."
+          ls -lh app/src/main/assets/kpimg-android
+          ls -lh app/src/main/jniLibs/arm64-v8a/libkptools.so
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build APK
+      - name: Build NEXUS ROOT APK
+        shell: bash
         run: |
+          set -euo pipefail
+
           gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NEXUS-ROOT-APK
+          name: NEXUS-ROOT-APATCH-ARM64
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-
-      - name: Upload KernelPatch tools
-        uses: actions/upload-artifact@v4
-        with:
-          name: NEXUS-ROOT-KERNELPATCH-ARM64
-          path: kernelpatch-tools/*
           if-no-files-found: error
