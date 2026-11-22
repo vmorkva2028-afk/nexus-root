@@ -3,7 +3,6 @@ name: Build NEXUS ROOT APK
 
 on:
   workflow_dispatch:
-
   push:
     branches:
       - main
@@ -66,7 +65,7 @@ jobs:
       - name: Install and configure Android SDK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
 
@@ -94,13 +93,21 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
+          # Accept licenses without failing on yes receiving SIGPIPE.
+          set +e
           yes | "$SDKMANAGER" \
             --sdk_root="$ANDROID_SDK_ROOT" \
             --licenses >/dev/null
+          SDK_LICENSE_STATUS=${PIPESTATUS[1]}
+          set -e
+
+          if [ "$SDK_LICENSE_STATUS" -ne 0 ]; then
+            echo "::error::Android SDK license acceptance failed"
+            exit 1
+          fi
 
           "$SDKMANAGER" \
             --sdk_root="$ANDROID_SDK_ROOT" \
@@ -116,7 +123,7 @@ jobs:
       - name: Extract NEXUS ROOT source
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           ZIP_FILE="$GITHUB_WORKSPACE/NEXUS_ROOT_BOOT_PATCHER_v1.zip"
 
@@ -162,7 +169,7 @@ jobs:
       - name: Build KernelPatch ARM64 kpimg
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           KP_DIR="$RUNNER_TEMP/KernelPatch"
 
@@ -200,7 +207,7 @@ jobs:
       - name: Build Android ARM64 kptools
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           KP_DIR="$RUNNER_TEMP/KernelPatch"
           BUILD_DIR="$RUNNER_TEMP/kptools-android-build"
@@ -230,7 +237,7 @@ jobs:
       - name: Install KernelPatch binaries into Android assets
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           ASSETS_DIR="$PROJECT_DIR/app/src/main/assets"
           mkdir -p "$ASSETS_DIR"
@@ -245,7 +252,7 @@ jobs:
         shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -e
+          set -euo pipefail
 
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
@@ -257,7 +264,7 @@ jobs:
       - name: Verify APK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
 
