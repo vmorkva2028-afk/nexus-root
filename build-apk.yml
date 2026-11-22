@@ -1,0 +1,137 @@
+name: Build NEXUS ROOT APatch ARM64 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'NEXUS_ROOT_BOOT_PATCHER_v1.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-root-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Extract source ZIP and build APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Android project from ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$GITHUB_WORKSPACE/NEXUS_ROOT_BOOT_PATCHER_v1.zip"
+          test -f "$ARCHIVE" || {
+            echo "ERROR: NEXUS_ROOT_BOOT_PATCHER_v1.zip was not found in repository root."
+            exit 1
+          }
+          DEST="$RUNNER_TEMP/nexus-root-source"
+          mkdir -p "$DEST"
+          unzip -q "$ARCHIVE" -d "$DEST"
+          PROJECT_DIR="$(find "$DEST" -type f \( -name settings.gradle.kts -o -name settings.gradle \) -printf '%h\n' | head -n 1)"
+          test -n "$PROJECT_DIR" || {
+            echo "ERROR: ZIP does not contain settings.gradle(.kts). Check the archive structure."
+            exit 1
+          }
+          test -d "$PROJECT_DIR/app" || {
+            echo "ERROR: Android app/ directory is missing from the extracted project."
+            exit 1
+          }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project extracted to: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 2 -type f | sort | head -80
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl unzip xz-utils cmake ninja-build file
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          yes | sdkmanager --licenses
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Build KernelPatch ARM64 kpimg and Android kptools
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/bmax121/KernelPatch.git "$RUNNER_TEMP/KernelPatch"
+          KP="$RUNNER_TEMP/KernelPatch"
+          VERSION=12.2.rel1
+          ARCHIVE="arm-gnu-toolchain-${VERSION}-x86_64-aarch64-none-elf.tar.xz"
+          URL="https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
+          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/$ARCHIVE"
+          mkdir -p "$RUNNER_TEMP/arm-toolchain"
+          tar -xJf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP/arm-toolchain" --strip-components=1
+          export TARGET_COMPILE="$RUNNER_TEMP/arm-toolchain/bin/aarch64-none-elf-"
+          export ANDROID=1
+          make -C "$KP/kernel" -j2 hdr kpimg
+          test -s "$KP/kernel/kpimg"
+          install -D -m 0644 "$KP/kernel/kpimg" "$PROJECT_DIR/app/src/main/assets/kpimg-android"
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cmake -S "$KP/tools" -B "$RUNNER_TEMP/kptools-build" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/kptools-build" --parallel 2
+          KPT="$(find "$RUNNER_TEMP/kptools-build" -type f -name kptools -perm -u+x -print -quit)"
+          test -n "$KPT"
+          install -D -m 0755 "$KPT" "$PROJECT_DIR/app/src/main/assets/kptools-arm64"
+          file "$PROJECT_DIR/app/src/main/assets/kptools-arm64"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nexus-release"
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK" || { echo 'ERROR: APK output not found'; exit 1; }
+          cp "$APK" "$RUNNER_TEMP/nexus-release/NEXUS_ROOT_APatch_ARM64_debug.apk"
+          ls -lh "$RUNNER_TEMP/nexus-release/NEXUS_ROOT_APatch_ARM64_debug.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-ROOT-APATCH-ARM64-APK
+          path: ${{ runner.temp }}/nexus-release/*.apk
+          if-no-files-found: error
+          retention-days: 14
