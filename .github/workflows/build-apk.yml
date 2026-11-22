@@ -1,5 +1,4 @@
 name: Build NEXUS ROOT APatch APK
-
 on:
   workflow_dispatch:
   push:
@@ -45,8 +44,6 @@ jobs:
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
           unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
           mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-          
-          # Единый путь для всех переменных
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
@@ -72,23 +69,21 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f "gradlew" ] || [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-            echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            P_DIR="$GITHUB_WORKSPACE"
           else
             ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
             if [ -n "$ZIP_FILE" ]; then
               DEST="$RUNNER_TEMP/extracted_project"
               mkdir -p "$DEST"
               unzip -q "$ZIP_FILE" -d "$DEST"
-              EXTRACTED_DIR=$(find "$DEST" -maxdepth 3 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) -printf '%h\n' | head -n 1)
-              echo "PROJECT_DIR=$EXTRACTED_DIR" >> "$GITHUB_ENV"
+              P_DIR=$(find "$DEST" -maxdepth 3 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) -printf '%h\n' | head -n 1)
             else
               echo "Error: No source code or ZIP found."
               exit 1
             fi
           fi
-          
-          # Явно фиксируем путь для Gradle
-          echo "sdk.dir=$HOME/android-sdk" > "$PROJECT_DIR/local.properties"
+          echo "PROJECT_DIR=$P_DIR" >> "$GITHUB_ENV"
+          echo "sdk.dir=$HOME/android-sdk" > "$P_DIR/local.properties"
 
       - name: Download APatch Binaries
         shell: bash
