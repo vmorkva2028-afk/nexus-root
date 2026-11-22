@@ -1,0 +1,145 @@
+name: Build NEXUS ROOT APatch APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'NEXUS_ROOT_SOURCE(1).zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-apatch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build NEXUS ROOT with official KernelPatch tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract NEXUS ROOT source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$GITHUB_WORKSPACE/NEXUS_ROOT_SOURCE(1).zip"
+          test -s "$ARCHIVE" || { echo '::error::NEXUS_ROOT_SOURCE(1).zip is missing at repository root'; exit 1; }
+          DEST="$RUNNER_TEMP/nexus-source"
+          mkdir -p "$DEST"
+          unzip -q "$ARCHIVE" -d "$DEST"
+          test -f "$DEST/settings.gradle.kts" || { echo '::error::settings.gradle.kts not found in source archive root'; find "$DEST" -maxdepth 3 -type f | head -80; exit 1; }
+          test -f "$DEST/app/src/main/java/com/nexus/root/ApPatchEngine.kt" || { echo '::error::ApPatchEngine.kt missing'; exit 1; }
+          echo "PROJECT_DIR=$DEST" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git curl xz-utils unzip zip file binutils
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_DIR/local.properties"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install AArch64 bare-metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=14.2.rel1
+          ARCHIVE="arm-gnu-toolchain-${VERSION}-x86_64-aarch64-none-elf.tar.xz"
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VERSION}/binrel/${ARCHIVE}"
+          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/$ARCHIVE"
+          mkdir -p "$RUNNER_TEMP/arm-toolchain"
+          tar -xJf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP/arm-toolchain" --strip-components=1
+          echo "$RUNNER_TEMP/arm-toolchain/bin" >> "$GITHUB_PATH"
+          echo "TARGET_COMPILE=$RUNNER_TEMP/arm-toolchain/bin/aarch64-none-elf-" >> "$GITHUB_ENV"
+
+      - name: Build pinned official KernelPatch 0.13.9 tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          KP_SRC="$RUNNER_TEMP/KernelPatch"
+          git clone --depth 1 --branch 0.13.9 https://github.com/bmax121/KernelPatch.git "$KP_SRC"
+          echo "KernelPatch commit: $(git -C "$KP_SRC" rev-parse HEAD)"
+
+          # Build the Android-enabled ARM64 kpimg and generate shared headers.
+          make -C "$KP_SRC/kernel" hdr kpimg -j2 \
+            TARGET_COMPILE="$TARGET_COMPILE" ANDROID=1
+
+          KPIMG="$KP_SRC/kernel/kpimg"
+          test -s "$KPIMG" || { echo '::error::kpimg build output missing'; exit 1; }
+          test "$(stat -c %s "$KPIMG")" -gt 4096
+
+          # kptools is compiled as an Android ARM64 executable, not a Linux host binary.
+          cmake -S "$KP_SRC/tools" -B "$KP_SRC/tools/build-android" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26
+          cmake --build "$KP_SRC/tools/build-android" --parallel 2
+
+          KPTOOLS="$KP_SRC/tools/build-android/kptools"
+          test -s "$KPTOOLS" || { echo '::error::Android kptools build output missing'; exit 1; }
+          file "$KPTOOLS"
+          readelf -h "$KPTOOLS" | grep -q 'AArch64' || { echo '::error::kptools is not ARM64'; exit 1; }
+
+          mkdir -p "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a" "$PROJECT_DIR/app/src/main/assets"
+          install -m 0755 "$KPTOOLS" "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so"
+          install -m 0644 "$KPIMG" "$PROJECT_DIR/app/src/main/assets/kpimg-android"
+          install -m 0644 "$KP_SRC/LICENSE" "$PROJECT_DIR/app/src/main/assets/KernelPatch-LICENSE"
+          sha256sum "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so" "$PROJECT_DIR/app/src/main/assets/kpimg-android" | tee "$RUNNER_TEMP/kernelpatch-sha256.txt"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon clean :app:assembleDebug --stacktrace
+
+      - name: Verify APK and publish build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK" || { echo '::error::APK was not generated'; exit 1; }
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
+          OUT="$RUNNER_TEMP/nexus-artifact"
+          mkdir -p "$OUT"
+          cp "$APK" "$OUT/NEXUS_ROOT_APatch_ARM64_debug.apk"
+          cp "$RUNNER_TEMP/kernelpatch-sha256.txt" "$OUT/KernelPatch-binaries.sha256"
+          {
+            echo "KernelPatch tag: 0.13.9"
+            echo "APK SHA-256: $(sha256sum "$OUT/NEXUS_ROOT_APatch_ARM64_debug.apk" | cut -d' ' -f1)"
+            echo "Build type: debug (Gradle debug signing)"
+          } > "$OUT/BUILD-INFO.txt"
+
+      - name: Upload APK and diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-ROOT-APatch-ARM64
+          path: ${{ runner.temp }}/nexus-artifact/*
+          if-no-files-found: error
+          retention-days: 14
