@@ -35,40 +35,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1 || true)
           if [ -z "$ZIP_FILE" ]; then
             echo "::error::Source ZIP not found in repository root"
             exit 1
           fi
-
           echo "Found archive: $ZIP_FILE"
           mkdir -p extracted
           unzip -oq "$ZIP_FILE" -d extracted
-
           if [ -f extracted/settings.gradle.kts ] || [ -f extracted/settings.gradle ]; then
             PROJECT_DIR="$(pwd)/extracted"
           else
             PROJECT_DIR=$(find extracted -maxdepth 2 -type f \( -name settings.gradle.kts -o -name settings.gradle \) -printf '%h\n' | head -n 1)
           fi
-
           if [ -z "${PROJECT_DIR:-}" ] || [ ! -d "$PROJECT_DIR/app" ]; then
             echo "::error::Android project not found inside ZIP"
             find extracted -maxdepth 4 -type f | head -100
             exit 1
           fi
-
           PROJECT_DIR=$(realpath "$PROJECT_DIR")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          if [ ! -x "$PROJECT_DIR/gradlew" ] && [ -f "$PROJECT_DIR/gradlew" ]; then
-            chmod +x "$PROJECT_DIR/gradlew"
-          fi
-          if [ ! -f "$PROJECT_DIR/gradlew" ] || [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "::error::Gradle Wrapper is missing from the source ZIP (gradlew + gradle/wrapper/gradle-wrapper.jar)"
+          chmod +x "$PROJECT_DIR/gradlew"
+          if [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "::error::Gradle Wrapper jar is missing"
             exit 1
           fi
-
           echo "Project directory: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
           "$PROJECT_DIR/gradlew" --version
@@ -77,23 +68,68 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           BASE="https://github.com/bmax121/KernelPatch/releases/download/${KERNELPATCH_VERSION}"
           mkdir -p "$PROJECT_DIR/app/src/main/assets"
           mkdir -p "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
-
           echo "Downloading kpimg-android ${KERNELPATCH_VERSION}..."
-          curl -fL --retry 3 -o "$PROJECT_DIR/app/src/main/assets/kpimg-android" \
-            "${BASE}/kpimg-android"
-
+          curl -fL --retry 3 -o "$PROJECT_DIR/app/src/main/assets/kpimg-android" "${BASE}/kpimg-android"
           echo "Downloading kptools-android ${KERNELPATCH_VERSION}..."
-          curl -fL --retry 3 -o "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so" \
-            "${BASE}/kptools-android"
-
+          curl -fL --retry 3 -o "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so" "${BASE}/kptools-android"
           chmod +x "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so"
-
           KPIMG_SIZE=$(stat -c%s "$PROJECT_DIR/app/src/main/assets/kpimg-android")
           TOOL_SIZE=$(stat -c%s "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so")
-
           if [ "$KPIMG_SIZE" -lt 4096 ] || [ "$TOOL_SIZE" -lt 4096 ]; then
-            echo
+            echo "::error::Downloaded KernelPatch binaries look too small"
+            ls -la "$PROJECT_DIR/app/src/main/assets/"
+            ls -la "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/"
+            exit 1
+          fi
+          echo "kpimg-android: ${KPIMG_SIZE} bytes"
+          echo "libkptools.so: ${TOOL_SIZE} bytes"
+          sha256sum "$PROJECT_DIR/app/src/main/assets/kpimg-android"
+          sha256sum "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build NEXUS ROOT APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK contains KernelPatch tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find "$PROJECT_DIR" -type f -path "*/build/outputs/apk/*/*.apk" | head -n 1 || true)
+          if [ -z "$APK" ]; then
+            echo "::error::APK was not generated"
+            exit 1
+          fi
+          echo "APK: $APK"
+          ls -lh "$APK"
+          TMP=$(mktemp -d)
+          unzip -l "$APK" | tee "$TMP/list.txt"
+          grep -E 'lib/arm64-v8a/libkptools\.so' "$TMP/list.txt"
+          grep -E 'assets/kpimg-android' "$TMP/list.txt"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/NEXUS-ROOT-v0.7-APatch-ARM64.apk"
+          echo "OK: APK contains kpimg-android and libkptools.so"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-ROOT-v0.7-APatch-ARM64
+          path: output/NEXUS-ROOT-v0.7-APatch-ARM64.apk
+          if-no-files-found: error
+          retention-days: 14
