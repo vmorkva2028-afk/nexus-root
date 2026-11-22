@@ -30,20 +30,39 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
+      # --- РУЧНАЯ УСТАНОВКА ANDROID SDK (ЧТОБЫ НЕ ПАДАЛО) ---
+      - name: Setup Android SDK manually
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-          yes | sdkmanager --licenses || true
+          set -e
+          echo "Downloading Android Command Line Tools..."
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O tools.zip
+          unzip -q tools.zip
+          mv cmdline-tools latest
+          rm tools.zip
+          
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
+          
+          echo "Accepting licenses..."
+          yes | sdkmanager --licenses > /dev/null || true
+          
+          echo "Installing SDK packages..."
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          
+          # Сохраняем пути для следующих шагов
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+      # ------------------------------------------------------
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
 
-      # --- ДОБАВЛЯЕМ СБОРКУ KPTOOLS ---
       - name: Build and Inject kptools
         run: |
           git clone --depth 1 https://github.com/bmax121/KernelPatch.git kp_source
@@ -56,13 +75,11 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
           
-          # Создаем папку в проекте и копируем бинарник
           mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
           cp kptools $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so
           chmod +x $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so
-      # ---------------------------------
 
-      - name: Locate project
+      - name: Locate project and chmod gradlew
         shell: bash
         run: |
           set -euo pipefail
@@ -78,7 +95,6 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Добавляем useLegacyPackaging, чтобы libkptools.so извлекался
           if [ -f "app/build.gradle.kts" ]; then
             sed -i '/android {/a \    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }' app/build.gradle.kts
           elif [ -f "app/build.gradle" ]; then
