@@ -1,304 +1,135 @@
-
 name: Build NEXUS ROOT APK
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     paths:
-      - 'NEXUS_ROOT_BOOT_PATCHER_v1.zip'
-      - '.github/workflows/build-apk.yml'
+      - '**'
+      - '!README.md'
 
 permissions:
   contents: read
 
 concurrency:
-  group: nexus-root-build-${{ github.ref }}
+  group: nexus-root-build
   cancel-in-progress: true
 
 jobs:
   build:
     name: Build NEXUS ROOT ARM64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      ANDROID_NDK_VERSION: 26.1.10909125
-      ANDROID_PLATFORM: android-35
-      BUILD_TOOLS_VERSION: 35.0.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            git \
-            curl \
-            wget \
-            unzip \
-            xz-utils \
-            zip \
-            cmake \
-            ninja-build \
-            file \
-            python3 \
-            pkg-config
-
-      - name: Setup Java 17
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses || true
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
         with:
-          gradle-version: '8.9'
+          ndk-version: r26b
 
-      - name: Install and configure Android SDK
-        shell: bash
+      # --- ДОБАВЛЯЕМ СБОРКУ KPTOOLS ---
+      - name: Build and Inject kptools
         run: |
-          set -euo pipefail
-
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-
-          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" \
-            -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "Downloading Android command line tools..."
-
-            mkdir -p "$RUNNER_TEMP/android-cmdline"
-            cd "$RUNNER_TEMP/android-cmdline"
-
-            wget -q \
-              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-              -O commandlinetools.zip
-
-            unzip -q commandlinetools.zip
-
-            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-            cp -a cmdline-tools/. \
-              "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
-
-            SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          fi
-
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-
-          # Accept licenses without failing on yes receiving SIGPIPE.
-          set +e
-          yes | "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --licenses >/dev/null
-          SDK_LICENSE_STATUS=${PIPESTATUS[1]}
-          set -e
-
-          if [ "$SDK_LICENSE_STATUS" -ne 0 ]; then
-            echo "::error::Android SDK license acceptance failed"
-            exit 1
-          fi
-
-          "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "ndk;26.1.10909125"
-
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
-
-      - name: Extract NEXUS ROOT source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP_FILE="$GITHUB_WORKSPACE/NEXUS_ROOT_BOOT_PATCHER_v1.zip"
-
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "::error::NEXUS_ROOT_BOOT_PATCHER_v1.zip not found in repository root"
-            exit 1
-          fi
-
-          EXTRACT_DIR="$RUNNER_TEMP/nexus-source"
-          mkdir -p "$EXTRACT_DIR"
-
-          unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
-
-          PROJECT_SETTINGS="$(find "$EXTRACT_DIR" \
-            -maxdepth 7 -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
-            -print -quit)"
-
-          if [ -z "$PROJECT_SETTINGS" ]; then
-            echo "::error::Gradle settings.gradle or settings.gradle.kts not found in ZIP"
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$PROJECT_SETTINGS")"
-
-          if [ ! -d "$PROJECT_DIR/app" ]; then
-            echo "::error::Android app directory not found: $PROJECT_DIR/app"
-            exit 1
-          fi
-
-          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
-            echo "::error::app/build.gradle or app/build.gradle.kts not found"
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Project found:"
-          echo "$PROJECT_DIR"
-          ls -la "$PROJECT_DIR"
-
-      - name: Build KernelPatch ARM64 kpimg
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          KP_DIR="$RUNNER_TEMP/KernelPatch"
-
-          git clone --depth 1 \
-            https://github.com/bmax121/KernelPatch.git \
-            "$KP_DIR"
-
-          TOOLCHAIN_DIR="$RUNNER_TEMP/arm-gnu-toolchain"
-          mkdir -p "$TOOLCHAIN_DIR"
-
-          wget -q \
-            https://developer.arm.com/-/media/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz \
-            -O "$RUNNER_TEMP/arm-toolchain.tar.xz"
-
-          tar -xf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
-            -C "$TOOLCHAIN_DIR" \
-            --strip-components=1
-
-          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
-          export TARGET_COMPILE="$TOOLCHAIN_DIR/bin/aarch64-none-elf-"
-          export ANDROID=1
-
-          make -C "$KP_DIR/kernel" hdr
-          make -C "$KP_DIR/kernel" -j"$(nproc)"
-
-          if [ ! -s "$KP_DIR/kernel/kpimg" ]; then
-            echo "::error::KernelPatch kpimg was not generated"
-            find "$KP_DIR/kernel" -maxdepth 2 -type f -name '*kpimg*'
-            exit 1
-          fi
-
-          echo "KP_DIR=$KP_DIR" >> "$GITHUB_ENV"
-          echo "KPIMG_PATH=$KP_DIR/kernel/kpimg" >> "$GITHUB_ENV"
-
-      - name: Build Android ARM64 kptools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          KP_DIR="$RUNNER_TEMP/KernelPatch"
-          BUILD_DIR="$RUNNER_TEMP/kptools-android-build"
-
-          cmake \
-            -S "$KP_DIR/tools" \
-            -B "$BUILD_DIR" \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+          git clone --depth 1 https://github.com/bmax121/KernelPatch.git kp_source
+          cd kp_source/tools
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-23 \
+            -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+          
+          # Создаем папку в проекте и копируем бинарник
+          mkdir -p $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a
+          cp kptools $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so
+          chmod +x $GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libkptools.so
+      # ---------------------------------
 
-          cmake --build "$BUILD_DIR" \
-            --parallel "$(nproc)"
-
-          KPTOOLS_BIN="$(find "$BUILD_DIR" \
-            -type f -name kptools -perm -111 -print -quit)"
-
-          if [ -z "$KPTOOLS_BIN" ]; then
-            echo "::error::ARM64 kptools binary was not generated"
-            find "$BUILD_DIR" -type f
-            exit 1
-          fi
-
-          echo "KPTOOLS_PATH=$KPTOOLS_BIN" >> "$GITHUB_ENV"
-
-      - name: Install KernelPatch binaries into Android assets
+      - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
-
-          ASSETS_DIR="$PROJECT_DIR/app/src/main/assets"
-          mkdir -p "$ASSETS_DIR"
-
-          install -m 0644 "$KPIMG_PATH" "$ASSETS_DIR/kpimg"
-          install -m 0755 "$KPTOOLS_PATH" "$ASSETS_DIR/kptools-arm64"
-
-          echo "KernelPatch assets installed:"
-          ls -lh "$ASSETS_DIR"
-
-      - name: Build NEXUS ROOT APK
-        shell: bash
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -euo pipefail
-
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew --no-daemon --stacktrace :app:assembleDebug
-          else
-            gradle --no-daemon --stacktrace :app:assembleDebug
+          if [ ! -f "./gradlew" ]; then
+            echo "ERROR: gradlew not found in repository root"
+            find . -maxdepth 3 -name gradlew -print
+            exit 1
           fi
+          chmod +x ./gradlew
 
-      - name: Verify APK
+      - name: Configure JVM 17 compatibility and Packaging
         shell: bash
         run: |
           set -euo pipefail
-
-          APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
-
-          if [ ! -d "$APK_DIR" ]; then
-            echo "::error::APK output directory not found"
-            exit 1
+          
+          # Добавляем useLegacyPackaging, чтобы libkptools.so извлекался
+          if [ -f "app/build.gradle.kts" ]; then
+            sed -i '/android {/a \    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }' app/build.gradle.kts
+          elif [ -f "app/build.gradle" ]; then
+             sed -i '/android {/a \    packagingOptions {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }' app/build.gradle
           fi
 
-          APK_FILE="$(find "$APK_DIR" -maxdepth 1 \
-            -type f -name '*.apk' -print -quit)"
+          python3 <<'PY'
+          from pathlib import Path
+          import re
 
-          if [ -z "$APK_FILE" ]; then
-            echo "::error::APK was not generated"
-            exit 1
-          fi
+          files = [Path("app/build.gradle"), Path("app/build.gradle.kts")]
+          found = False
 
-          echo "APK successfully generated:"
-          ls -lh "$APK_FILE"
-          file "$APK_FILE"
+          for path in files:
+              if not path.exists(): continue
+              found = True
+              text = path.read_text()
 
-      - name: Upload NEXUS ROOT APK
+              if path.name.endswith(".kts"):
+                  java_block = "\ncompileOptions {\n    sourceCompatibility = JavaVersion.VERSION_17\n    targetCompatibility = JavaVersion.VERSION_17\n}\n"
+                  kotlin_block = "\nkotlinOptions {\n    jvmTarget = \"17\"\n}\n"
+              else:
+                  java_block = "\ncompileOptions {\n    sourceCompatibility JavaVersion.VERSION_17\n    targetCompatibility JavaVersion.VERSION_17\n}\n"
+                  kotlin_block = "\nkotlinOptions {\n    jvmTarget = '17'\n}\n"
+
+              text = re.sub(r'compileOptions\s*\{[^{}]*\}', '', text)
+              text = re.sub(r'kotlinOptions\s*\{[^{}]*\}', '', text)
+
+              if "android {" not in text:
+                  raise SystemExit(f"Android block not found in {path}")
+
+              text = text.replace("android {", "android {" + java_block, 1)
+              text += "\n" + kotlin_block
+              path.write_text(text)
+          PY
+
+      - name: Verify Gradle
+        run: ./gradlew --version
+
+      - name: Build Debug APK
+        run: |
+          set -euo pipefail
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NEXUS-ROOT-ARM64-APK
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          name: NEXUS-ROOT-APK-ARM64
+          path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload KernelPatch build components
-        uses: actions/upload-artifact@v4
-        with:
-          name: NEXUS-ROOT-KERNELPATCH-ARM64
-          path: |
-            ${{ env.PROJECT_DIR }}/app/src/main/assets/kpimg
-            ${{ env.PROJECT_DIR }}/app/src/main/assets/kptools-arm64
-          if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
