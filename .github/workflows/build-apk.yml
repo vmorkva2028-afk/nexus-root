@@ -6,45 +6,218 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-root-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK manually
+      - name: Find and extract source ZIP
+        shell: bash
         run: |
-          mkdir -p $HOME/android-sdk/cmdline-tools
-          wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
-          unzip -q /tmp/cmdtools.zip -d $HOME/android-sdk/cmdline-tools
-          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
-          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
-          echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          set -euo pipefail
 
-      - name: Accept licenses and install components
+          ZIP_FILE=$(find . -maxdepth 1 -type f \
+            -iname "*.zip" | head -n 1 || true)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Source ZIP not found in repository root"
+            exit 1
+          fi
+
+          echo "Found archive: $ZIP_FILE"
+
+          mkdir -p extracted
+          unzip -oq "$ZIP_FILE" -d extracted
+
+          echo "Archive extracted successfully"
+
+      - name: Locate Android project
+        shell: bash
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          set -euo pipefail
 
-      - name: Setup NDK
-        uses: android-actions/setup-ndk@v1
+          SETTINGS=$(find extracted -type f \
+            \( -name settings.gradle \
+            -o -name settings.gradle.kts \) \
+            | head -n 1 || true)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Android settings.gradle not found"
+            find extracted -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          PROJECT_DIR=$(realpath "$PROJECT_DIR")
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project directory: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::App module not found"
+            exit 1
+          fi
+
+      - name: Detect Android Gradle Plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          AGP_VERSION=$(grep -RhoE \
+            'com\.android\.(application|library)["'\'']?[[:space:]]*version[[:space:]]*["'\''][0-9]+\.[0-9]+(\.[0-9]+)?' \
+            --include="*.gradle" \
+            --include="*.gradle.kts" \
+            . | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+            | head -n 1 || true)
+
+          if [ -z "$AGP_VERSION" ]; then
+            AGP_VERSION=$(grep -RhoE \
+              'com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+(\.[0-9]+)?' \
+              --include="*.gradle" . \
+              | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | head -n 1 || true)
+          fi
+
+          if [ -z "$AGP_VERSION" ]; then
+            echo "::error::Could not detect Android Gradle Plugin version"
+            exit 1
+          fi
+
+          echo "Detected AGP: $AGP_VERSION"
+          echo "AGP_VERSION=$AGP_VERSION" >> "$GITHUB_ENV"
+
+      - name: Select compatible Gradle version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AGP_MAJOR_MINOR=$(echo "$AGP_VERSION" | cut -d. -f1,2)
+
+          case "$AGP_MAJOR_MINOR" in
+            8.0) GRADLE_VERSION="8.0" ;;
+            8.1) GRADLE_VERSION="8.0" ;;
+            8.2) GRADLE_VERSION="8.2" ;;
+            8.3) GRADLE_VERSION="8.4" ;;
+            8.4) GRADLE_VERSION="8.6" ;;
+            8.5) GRADLE_VERSION="8.7" ;;
+            8.6) GRADLE_VERSION="8.7" ;;
+            8.7) GRADLE_VERSION="8.9" ;;
+            8.8) GRADLE_VERSION="8.10.2" ;;
+            8.9) GRADLE_VERSION="8.11.1" ;;
+            8.10) GRADLE_VERSION="8.11.1" ;;
+            8.11) GRADLE_VERSION="8.13" ;;
+            8.12) GRADLE_VERSION="8.13" ;;
+            8.13) GRADLE_VERSION="8.13" ;;
+            8.14) GRADLE_VERSION="8.14.3" ;;
+            9.*) GRADLE_VERSION="9.1.0" ;;
+            *)
+              echo "::error::Unknown AGP version: $AGP_VERSION"
+              exit 1
+              ;;
+          esac
+
+          echo "GRADLE_VERSION=$GRADLE_VERSION" >> "$GITHUB_ENV"
+          echo "Selected Gradle: $GRADLE_VERSION"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          ndk-version: '26.10909125'
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Build with Gradle
+      - name: Generate Gradle Wrapper
+        shell: bash
         run: |
-          chmod +x gradlew || true
-          ./gradlew assembleDebug --stacktrace
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          gradle wrapper \
+            --gradle-version "$GRADLE_VERSION" \
+            --distribution-type bin
+
+          chmod +x gradlew
+
+          echo "Gradle Wrapper generated"
+          ./gradlew --version
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager --licenses || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Build NEXUS ROOT APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          ./gradlew \
+            assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=$(find "$PROJECT_DIR" -type f \
+            -path "*/build/outputs/apk/*/*.apk" \
+            | head -n 1 || true)
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK was not generated"
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/NEXUS-ROOT-APatch.apk"
+
+          echo "APK successfully generated"
+          ls -lh "$GITHUB_WORKSPACE/output/"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: APK
-          path: app/build/outputs/apk/debug/*.apk
+          name: NEXUS-ROOT-APatch-APK
+          path: output/NEXUS-ROOT-APatch.apk
+          if-no-files-found: error
+          retention-days: 14
