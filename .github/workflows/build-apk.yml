@@ -30,7 +30,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # --- РУЧНАЯ УСТАНОВКА ANDROID SDK (ЧТОБЫ НЕ ПАДАЛО) ---
       - name: Setup Android SDK manually
         run: |
           set -e
@@ -51,12 +50,10 @@ jobs:
           echo "Installing SDK packages..."
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
           
-          # Сохраняем пути для следующих шагов
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-      # ------------------------------------------------------
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -67,6 +64,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/bmax121/KernelPatch.git kp_source
           cd kp_source/tools
+          
+          # Генерируем preset.h
+          python3 build_preset.py
+          
           mkdir build && cd build
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
