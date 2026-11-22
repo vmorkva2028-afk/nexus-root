@@ -89,15 +89,30 @@ jobs:
           sha256sum "$PROJECT_DIR/app/src/main/assets/kpimg-android"
           sha256sum "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libkptools.so"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK manually
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fL --retry 3 https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+          unzip -oq /tmp/cmdtools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools" >> "$GITHUB_ENV"
 
       - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --licenses || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          export PATH="$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools"
+          yes | sdkmanager --sdk_root="$HOME/android-sdk" --licenses > /dev/null || true
+          sdkmanager --sdk_root="$HOME/android-sdk" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0"
 
       - name: Build NEXUS ROOT APK
         shell: bash
